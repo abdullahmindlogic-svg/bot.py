@@ -1,0 +1,1361 @@
+# ============================================================
+# Premium Apps Assistant
+# Single-file Telegram Bot
+# Creator: Dev Abdullah
+# ============================================================
+
+import os
+import re
+import json
+import time
+import sqlite3
+import threading
+from datetime import datetime
+
+import requests
+import telebot
+from telebot import types
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Pydroid 3-এ চাইলে উপরের Environment Variable না থাকলে
+# নিচে নিজের Token বসাতে পারো।
+# GitHub-এ আপলোড করার আগে অবশ্যই আসল Token সরিয়ে দেবে।
+if not BOT_TOKEN:
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+BOT_NAME = "Premium Apps Assistant"
+CREATOR_NAME = "Dev Abdullah"
+
+OFFICIAL_WEBSITE = "https://premiumappspr.blogspot.com"
+
+CHANNEL_USERNAME = "@devabdullahofficial"
+CHANNEL_URL = "https://t.me/devabdullahofficial"
+
+CONTACT_USERNAME = "@dev_abdullah_official"
+CONTACT_URL = "https://t.me/dev_abdullah_official"
+
+
+# ============================================================
+# FIREBASE CONFIG
+# ============================================================
+
+FIREBASE_API_KEY = "AIzaSyBrMM4zjYzaiNb0uLJ8AoD3QdyCxFBtm5Y"
+FIREBASE_PROJECT_ID = "premium-apps-6051e"
+
+FIRESTORE_URL = (
+    "https://firestore.googleapis.com/v1/projects/"
+    + FIREBASE_PROJECT_ID
+    + "/databases/(default)/documents"
+)
+
+
+# ============================================================
+# LOCAL DATABASE
+# ============================================================
+
+DB_FILE = "premium_apps_memory.db"
+
+db_lock = threading.Lock()
+
+db = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
+)
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    language TEXT,
+    message_count INTEGER DEFAULT 0,
+    first_seen TEXT,
+    last_seen TEXT
+)
+""")
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    role TEXT,
+    message TEXT,
+    created_at TEXT
+)
+""")
+
+db.commit()
+
+
+# ============================================================
+# BOT INITIALIZATION
+# ============================================================
+
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    print("WARNING: Telegram Bot Token is not configured.")
+
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    parse_mode="HTML",
+    threaded=True
+)
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def now():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def clean_text(text):
+    if not text:
+        return ""
+    return text.strip()
+
+
+def normalize(text):
+    """
+    Bengali/English text সহজে matching করার জন্য।
+    """
+    text = clean_text(text).lower()
+
+    replacements = {
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+        "—": "-",
+        "–": "-",
+    }
+
+    for a, b in replacements.items():
+        text = text.replace(a, b)
+
+    text = re.sub(r"\s+", " ", text)
+
+    return text
+
+
+def contains_any(text, words):
+    return any(word in text for word in words)
+
+
+# ============================================================
+# USER MEMORY
+# ============================================================
+
+def save_user(message):
+    try:
+        user = message.from_user
+
+        user_id = user.id
+        username = user.username or ""
+        first_name = user.first_name or ""
+        last_name = user.last_name or ""
+
+        current = now()
+
+        with db_lock:
+            existing = db.execute(
+                "SELECT user_id, message_count FROM users WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+
+            if existing:
+                db.execute("""
+                    UPDATE users
+                    SET username=?,
+                        first_name=?,
+                        last_name=?,
+                        message_count=?,
+                        last_seen=?
+                    WHERE user_id=?
+                """, (
+                    username,
+                    first_name,
+                    last_name,
+                    existing[1] + 1,
+                    current,
+                    user_id
+                ))
+            else:
+                db.execute("""
+                    INSERT INTO users
+                    (
+                        user_id,
+                        username,
+                        first_name,
+                        last_name,
+                        language,
+                        message_count,
+                        first_seen,
+                        last_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    user_id,
+                    username,
+                    first_name,
+                    last_name,
+                    "unknown",
+                    1,
+                    current,
+                    current
+                ))
+
+            db.commit()
+
+    except Exception as e:
+        print("save_user error:", e)
+
+
+def save_memory(user_id, role, message):
+    try:
+        with db_lock:
+            db.execute("""
+                INSERT INTO memory
+                (user_id, role, message, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (
+                user_id,
+                role,
+                message,
+                now()
+            ))
+
+            # প্রতিটি user-এর সর্বশেষ 100 message রাখবে
+            db.execute("""
+                DELETE FROM memory
+                WHERE user_id=?
+                AND id NOT IN (
+                    SELECT id
+                    FROM memory
+                    WHERE user_id=?
+                    ORDER BY id DESC
+                    LIMIT 100
+                )
+            """, (user_id, user_id))
+
+            db.commit()
+
+    except Exception as e:
+        print("save_memory error:", e)
+
+
+def get_memory(user_id, limit=20):
+    try:
+        with db_lock:
+            rows = db.execute("""
+                SELECT role, message
+                FROM memory
+                WHERE user_id=?
+                ORDER BY id DESC
+                LIMIT ?
+            """, (
+                user_id,
+                limit
+            )).fetchall()
+
+        rows.reverse()
+        return rows
+
+    except Exception as e:
+        print("get_memory error:", e)
+        return []
+
+
+# ============================================================
+# FIRESTORE MEMORY
+# ============================================================
+
+def firebase_save(user_id, role, message):
+    """
+    Firebase Firestore REST API-তে memory save করার চেষ্টা করে।
+
+    Firebase Security Rules যদি unauthenticated write অনুমতি না দেয়,
+    তাহলে এটি ব্যর্থ হতে পারে। সেই ক্ষেত্রে Local SQLite memory
+    স্বাভাবিকভাবে কাজ করবে।
+    """
+
+    try:
+        document_id = (
+            str(user_id)
+            + "_"
+            + str(int(time.time() * 1000))
+        )
+
+        url = (
+            FIRESTORE_URL
+            + "/bot_memory/"
+            + document_id
+            + "?key="
+            + FIREBASE_API_KEY
+        )
+
+        data = {
+            "fields": {
+                "user_id": {
+                    "integerValue": str(user_id)
+                },
+                "role": {
+                    "stringValue": role
+                },
+                "message": {
+                    "stringValue": message
+                },
+                "created_at": {
+                    "stringValue": now()
+                }
+            }
+        }
+
+        response = requests.post(
+            url,
+            json=data,
+            timeout=10
+        )
+
+        if response.status_code not in (200, 201):
+            print(
+                "Firebase save failed:",
+                response.status_code,
+                response.text[:300]
+            )
+
+    except Exception as e:
+        print("Firebase error:", e)
+
+
+def save_all_memory(user_id, role, message):
+    # Local memory immediately
+    save_memory(
+        user_id,
+        role,
+        message
+    )
+
+    # Firebase background save
+    threading.Thread(
+        target=firebase_save,
+        args=(user_id, role, message),
+        daemon=True
+    ).start()
+
+
+# ============================================================
+# KEYBOARD MENUS
+# ============================================================
+
+def main_menu():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📢 Updates Channel",
+            url=CHANNEL_URL
+        ),
+        types.InlineKeyboardButton(
+            "⚡ Bot Speed",
+            callback_data="bot_speed"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📊 Statistics",
+            callback_data="statistics"
+        ),
+        types.InlineKeyboardButton(
+            "👨‍💻 Contact Owner",
+            callback_data="contact_owner"
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "🌐 Official Website",
+            url=OFFICIAL_WEBSITE
+        )
+    )
+
+    return markup
+
+
+def contact_menu():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "👨‍💻 Contact Owner",
+            url=CONTACT_URL
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "📢 Creator Channel",
+            url=CHANNEL_URL
+        )
+    )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "🌐 Official Website",
+            url=OFFICIAL_WEBSITE
+        )
+    )
+
+    return markup
+
+
+# ============================================================
+# DIRECT USERNAME / LINK DETECTION
+# ============================================================
+
+def is_direct_request(text):
+    """
+    User Button না চেয়ে সরাসরি username/link চাইলে True।
+    """
+
+    t = normalize(text)
+
+    direct_words = [
+        "username দাও",
+        "username দিন",
+        "ইউজারনেম দাও",
+        "ইউজারনেম দিন",
+        "শুধু username",
+        "শুধু ইউজারনেম",
+        "username চাই",
+        "ইউজারনেম চাই",
+        "username নেব",
+        "ইউজারনেম নেব",
+        "লিংক দাও",
+        "লিংক দিন",
+        "link দাও",
+        "link দিন",
+        "telegram link দাও",
+        "টেলিগ্রাম লিংক দাও",
+        "button লাগবে না",
+        "বাটন লাগবে না",
+        "button দরকার নেই",
+        "বাটন দরকার নেই",
+        "no button",
+        "without button",
+        "don't need button",
+        "just username",
+        "give username",
+        "give me username",
+        "owner username",
+        "creator username",
+        "owner link",
+        "creator link",
+        "channel username",
+        "channel link",
+    ]
+
+    return contains_any(t, direct_words)
+
+
+def is_contact_direct_request(text):
+    t = normalize(text)
+
+    contact_words = [
+        "owner username",
+        "creator username",
+        "owner link",
+        "creator link",
+        "যোগাযোগের username",
+        "যোগাযোগের ইউজারনেম",
+        "owner এর username",
+        "owner-এর username",
+        "owner এর ইউজারনেম",
+        "creator এর username",
+        "creator-এর username",
+        "creator এর ইউজারনেম",
+        "শুধু username দাও",
+        "শুধু ইউজারনেম দাও",
+        "username দাও",
+        "ইউজারনেম দাও",
+    ]
+
+    return contains_any(t, contact_words)
+
+
+def is_channel_direct_request(text):
+    t = normalize(text)
+
+    channel_words = [
+        "channel username",
+        "channel link",
+        "চ্যানেল username",
+        "চ্যানেল ইউজারনেম",
+        "চ্যানেলের username",
+        "চ্যানেলের ইউজারনেম",
+        "চ্যানেল লিংক",
+        "চ্যানেলের লিংক",
+        "শুধু channel username",
+        "give channel username",
+        "give channel link",
+    ]
+
+    return contains_any(t, channel_words)
+
+
+# ============================================================
+# DIRECT INFORMATION RESPONSE
+# ============================================================
+
+def direct_info_response(text):
+    t = normalize(text)
+
+    # Channel
+    if is_channel_direct_request(t):
+        return (
+            "📢 <b>Updates Channel</b>\n\n"
+            f"Username: <code>{CHANNEL_USERNAME}</code>\n"
+            f"Link: {CHANNEL_URL}"
+        )
+
+    # Owner / Creator
+    if is_contact_direct_request(t):
+        return (
+            "👨‍💻 <b>Creator / Owner</b>\n\n"
+            f"Name: <b>{CREATOR_NAME}</b>\n"
+            f"Username: <code>{CONTACT_USERNAME}</code>\n"
+            f"Link: {CONTACT_URL}"
+        )
+
+    return None
+
+
+# ============================================================
+# APP / GAME SEARCH
+# ============================================================
+
+def looks_like_app_search(text):
+    t = normalize(text)
+
+    words = [
+        "app",
+        "apps",
+        "application",
+        "software",
+        "game",
+        "games",
+        "অ্যাপ",
+        "অ্যাপস",
+        "সফটওয়্যার",
+        "সফটওয়্যার",
+        "গেম",
+        "গেমস",
+        "ডাউনলোড",
+        "download",
+        "apk",
+        "mod apk",
+        "premium app",
+        "paid app",
+    ]
+
+    return contains_any(t, words)
+
+
+def extract_search_query(text):
+    t = clean_text(text)
+
+    patterns = [
+        r"(?:search|find|খুঁজে দাও|খুজে দাও|খুঁজে দিন|খুজে দিন)\s+(.+)",
+        r"(?:download|ডাউনলোড)\s+(.+)",
+        r"(?:অ্যাপ|app)\s+(.+)",
+        r"(?:গেম|game)\s+(.+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            t,
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            query = match.group(1).strip()
+
+            if query:
+                return query
+
+    return t
+
+
+def search_web(query):
+    """
+    DuckDuckGo HTML search ব্যবহার করে সাধারণ search result আনার চেষ্টা।
+
+    কোনো API key দরকার নেই।
+    Search result-এর ওপর নির্ভর করে availability পরিবর্তিত হতে পারে।
+    """
+
+    try:
+        url = "https://html.duckduckgo.com/html/"
+
+        response = requests.get(
+            url,
+            params={"q": query},
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0 (Android) AppleWebKit/537.36 "
+                    "Chrome/120 Mobile Safari/537.36"
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return []
+
+        html = response.text
+
+        results = []
+
+        # DuckDuckGo result link extraction
+        pattern = re.compile(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        for match in pattern.finditer(html):
+            link = match.group(1)
+
+            title = re.sub(
+                r"<.*?>",
+                "",
+                match.group(2)
+            )
+
+            title = title.strip()
+
+            if title and link:
+                results.append(
+                    {
+                        "title": title,
+                        "link": link
+                    }
+                )
+
+            if len(results) >= 5:
+                break
+
+        return results
+
+    except Exception as e:
+        print("Search error:", e)
+        return []
+
+
+def app_search_response(text):
+    query = extract_search_query(text)
+
+    if not query:
+        return (
+            "📱 কোন App বা Game খুঁজছেন?\n\n"
+            "উদাহরণ:\n"
+            "<code>CapCut app</code>\n"
+            "<code>Android game</code>"
+        )
+
+    results = search_web(query)
+
+    if not results:
+        return (
+            "দুঃখিত, এই মুহূর্তে Search Result পাওয়া যাচ্ছে না।\n\n"
+            f"🔎 Search: <b>{query}</b>"
+        )
+
+    answer = (
+        f"🔎 <b>Search Result</b>\n"
+        f"Query: <code>{query}</code>\n\n"
+    )
+
+    for i, item in enumerate(results, 1):
+        title = item["title"]
+        link = item["link"]
+
+        answer += (
+            f"{i}. <b>{title}</b>\n"
+            f"{link}\n\n"
+        )
+
+    return answer
+
+
+# ============================================================
+# SMART RESPONSE
+# ============================================================
+
+def smart_response(message):
+    text = clean_text(message.text)
+
+    if not text:
+        return "আমি আপনার মেসেজটি বুঝতে পারিনি।"
+
+    t = normalize(text)
+
+    # --------------------------------------------------------
+    # Direct username/link requests MUST come first
+    # --------------------------------------------------------
+
+    direct = direct_info_response(t)
+
+    if direct:
+        return direct
+
+    # Generic direct request
+    if is_direct_request(t):
+
+        if contains_any(t, [
+            "channel",
+            "চ্যানেল"
+        ]):
+            return (
+                "📢 <b>Channel Username</b>\n\n"
+                f"<code>{CHANNEL_USERNAME}</code>\n\n"
+                f"🔗 {CHANNEL_URL}"
+            )
+
+        return (
+            "👨‍💻 <b>Creator / Owner Username</b>\n\n"
+            f"<code>{CONTACT_USERNAME}</code>\n\n"
+            f"🔗 {CONTACT_URL}"
+        )
+
+    # --------------------------------------------------------
+    # Greetings
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "hello",
+        "hi",
+        "hey",
+        "হাই",
+        "হ্যালো",
+        "আসসালামু আলাইকুম",
+        "সালাম"
+    ]):
+        return (
+            "ওয়ালাইকুমুস সালাম! 👋\n\n"
+            f"আমি <b>{BOT_NAME}</b>।\n"
+            "আপনাকে কীভাবে সাহায্য করতে পারি?"
+        )
+
+    # --------------------------------------------------------
+    # Bot name
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "তোমার নাম",
+        "আপনার নাম",
+        "নাম কি",
+        "নাম কী",
+        "what is your name",
+        "what's your name",
+        "your name"
+    ]):
+        return (
+            f"🤖 আমার নাম <b>{BOT_NAME}</b>।"
+        )
+
+    # --------------------------------------------------------
+    # Who created bot?
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "কে বানিয়েছে",
+        "কে বানিয়েছে",
+        "কে তৈরি করেছে",
+        "তোমাকে কে বানিয়েছে",
+        "তোমাকে কে বানিয়েছে",
+        "তোমার creator কে",
+        "তোমার ক্রিয়েটর কে",
+        "তোমার ক্রিয়েটর কে",
+        "who created you",
+        "who made you",
+        "who is your creator",
+        "your creator",
+        "creator কে"
+    ]):
+        return (
+            f"👨‍💻 আমাকে তৈরি করেছেন "
+            f"<b>{CREATOR_NAME}</b>।"
+        )
+
+    # --------------------------------------------------------
+    # Creator / Owner
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "creator",
+        "ক্রিয়েটর",
+        "ক্রিয়েটর",
+        "owner",
+        "ওনার",
+        "মালিক",
+        "বানানো ব্যক্তি",
+        "যিনি বানিয়েছেন",
+        "যিনি বানিয়েছেন"
+    ]):
+
+        if contains_any(t, [
+            "channel",
+            "চ্যানেল"
+        ]):
+            return (
+                "📢 <b>Creator Channel</b>\n\n"
+                f"Username: <code>{CHANNEL_USERNAME}</code>\n"
+                f"Link: {CHANNEL_URL}"
+            )
+
+        return (
+            f"👨‍💻 <b>Creator / Owner</b>\n\n"
+            f"নাম: <b>{CREATOR_NAME}</b>\n"
+            f"Contact: <code>{CONTACT_USERNAME}</code>\n"
+            f"Link: {CONTACT_URL}"
+        )
+
+    # --------------------------------------------------------
+    # Contact
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "যোগাযোগ",
+        "contact",
+        "যোগাযোগ করব",
+        "কীভাবে যোগাযোগ",
+        "কিভাবে যোগাযোগ",
+        "how can i contact",
+        "how to contact",
+        "contact you",
+        "contact creator",
+        "contact owner"
+    ]):
+        return (
+            "অবশ্যই। 👨‍💻\n\n"
+            "Creator / Owner-এর সাথে যোগাযোগ করতে নিচের "
+            "Button ব্যবহার করতে পারেন।"
+        )
+
+    # --------------------------------------------------------
+    # Phone number request
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "ফোন নাম্বার",
+        "ফোন নম্বর",
+        "মোবাইল নাম্বার",
+        "মোবাইল নম্বর",
+        "phone number",
+        "mobile number",
+        "number দাও",
+        "number দিন"
+    ]):
+        return (
+            "📞 ব্যক্তিগত ফোন নম্বর আমার কাছে সংরক্ষিত নেই।\n\n"
+            f"যোগাযোগের জন্য Telegram ব্যবহার করুন:\n"
+            f"<code>{CONTACT_USERNAME}</code>\n"
+            f"{CONTACT_URL}"
+        )
+
+    # --------------------------------------------------------
+    # Official website
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "website",
+        "ওয়েবসাইট",
+        "ওয়েবসাইট",
+        "সাইট দাও",
+        "site দাও",
+        "official website",
+        "official site"
+    ]):
+        return (
+            "🌐 <b>Official Website</b>\n\n"
+            f"{OFFICIAL_WEBSITE}"
+        )
+
+    # --------------------------------------------------------
+    # Channel
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "channel",
+        "চ্যানেল",
+        "আপডেট চ্যানেল",
+        "updates channel",
+        "update channel"
+    ]):
+        return (
+            "📢 আমাদের Updates Channel-এর জন্য নিচের Button ব্যবহার করুন।"
+        )
+
+    # --------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "statistics",
+        "stats",
+        "স্ট্যাটিসটিক",
+        "পরিসংখ্যান",
+        "কতজন ব্যবহার",
+        "users"
+    ]):
+        return get_statistics_text()
+
+    # --------------------------------------------------------
+    # Bot speed
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "bot speed",
+        "speed",
+        "স্পিড",
+        "গতি",
+        "কত দ্রুত"
+    ]):
+        return (
+            "⚡ <b>Bot Speed</b>\n\n"
+            "Bot দ্রুততার সাথে আপনার message process করার চেষ্টা করে।"
+        )
+
+    # --------------------------------------------------------
+    # App search
+    # --------------------------------------------------------
+
+    if looks_like_app_search(t):
+        return app_search_response(text)
+
+    # --------------------------------------------------------
+    # Help
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "help",
+        "সাহায্য",
+        "কি করতে পারো",
+        "কী করতে পারো",
+        "what can you do"
+    ]):
+        return (
+            f"🤖 <b>{BOT_NAME}</b>\n\n"
+            "আমি App/Game খুঁজতে, সাধারণ প্রশ্নের উত্তর দিতে, "
+            "Creator/Owner-এর তথ্য দিতে এবং বিভিন্ন তথ্য দেখাতে পারি।\n\n"
+            "📱 App খুঁজতে লিখুন:\n"
+            "<code>CapCut app</code>\n\n"
+            "👨‍💻 Creator জানতে লিখুন:\n"
+            "<code>তোমাকে কে বানিয়েছে?</code>"
+        )
+
+    # --------------------------------------------------------
+    # Simple thanks
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "thanks",
+        "thank you",
+        "ধন্যবাদ",
+        "থ্যাংকস"
+    ]):
+        return (
+            "আপনাকেও ধন্যবাদ! 😊\n"
+            "আর কোনো সাহায্য লাগলে বলুন।"
+        )
+
+    # --------------------------------------------------------
+    # Goodbye
+    # --------------------------------------------------------
+
+    if contains_any(t, [
+        "bye",
+        "বিদায়",
+        "বিদায়",
+        "পরে কথা হবে",
+        "goodbye"
+    ]):
+        return (
+            "আচ্ছা ভাই। 😊\n"
+            "আবার কথা হবে।"
+        )
+
+    # --------------------------------------------------------
+    # Default
+    # --------------------------------------------------------
+
+    return (
+        "আমি আপনার কথাটি বুঝতে চেষ্টা করছি। 🤖\n\n"
+        "আরেকটু পরিষ্কার করে বলুন।\n\n"
+        "উদাহরণ:\n"
+        "• <code>তোমার নাম কী?</code>\n"
+        "• <code>তোমাকে কে বানিয়েছে?</code>\n"
+        "• <code>owner username দাও</code>\n"
+        "• <code>channel username দাও</code>\n"
+        "• <code>CapCut app</code>"
+    )
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def get_statistics():
+    try:
+        with db_lock:
+            total_users = db.execute(
+                "SELECT COUNT(*) FROM users"
+            ).fetchone()[0]
+
+            total_messages = db.execute(
+                "SELECT COALESCE(SUM(message_count), 0) FROM users"
+            ).fetchone()[0]
+
+        return total_users, total_messages
+
+    except Exception as e:
+        print("Statistics error:", e)
+        return 0, 0
+
+
+def get_statistics_text():
+    users, messages = get_statistics()
+
+    return (
+        "📊 <b>Bot Statistics</b>\n\n"
+        f"👥 Users: <b>{users}</b>\n"
+        f"💬 Messages: <b>{messages}</b>\n"
+        f"🤖 Bot: <b>{BOT_NAME}</b>"
+    )
+
+
+# ============================================================
+# START COMMAND
+# ============================================================
+
+@bot.message_handler(commands=["start"])
+def start_command(message):
+
+    save_user(message)
+
+    first_name = message.from_user.first_name or "বন্ধু"
+
+    save_all_memory(
+        message.from_user.id,
+        "user",
+        "/start"
+    )
+
+    answer = (
+        f"আসসালামু আলাইকুম, <b>{first_name}</b>! 👋\n\n"
+        f"🤖 স্বাগতম <b>{BOT_NAME}</b>-এ।\n\n"
+        "আমি আপনার App, Game এবং বিভিন্ন তথ্য খুঁজতে "
+        "সহায়তা করতে পারি।\n\n"
+        "নিচের Menu ব্যবহার করুন অথবা সরাসরি আমাকে প্রশ্ন করুন।"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        answer,
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# HELP COMMAND
+# ============================================================
+
+@bot.message_handler(commands=["help"])
+def help_command(message):
+
+    save_user(message)
+
+    answer = smart_response(
+        types.SimpleNamespace(
+            text="help"
+        )
+    )
+
+    bot.send_message(
+        message.chat.id,
+        answer
+    )
+
+
+# ============================================================
+# MENU COMMAND
+# ============================================================
+
+@bot.message_handler(commands=["menu"])
+def menu_command(message):
+
+    save_user(message)
+
+    bot.send_message(
+        message.chat.id,
+        "📋 <b>Main Menu</b>",
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# CALLBACK BUTTONS
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: True
+)
+def callback_handler(call):
+
+    try:
+
+        if call.data == "bot_speed":
+
+            bot.answer_callback_query(
+                call.id,
+                "⚡ Bot is running!"
+            )
+
+            bot.send_message(
+                call.message.chat.id,
+                (
+                    "⚡ <b>Bot Speed</b>\n\n"
+                    "আপনার message দ্রুত process করা হচ্ছে।"
+                )
+            )
+
+        elif call.data == "statistics":
+
+            bot.answer_callback_query(
+                call.id,
+                "📊 Statistics"
+            )
+
+            bot.send_message(
+                call.message.chat.id,
+                get_statistics_text()
+            )
+
+        elif call.data == "contact_owner":
+
+            bot.answer_callback_query(
+                call.id,
+                "👨‍💻 Contact Owner"
+            )
+
+            bot.send_message(
+                call.message.chat.id,
+                (
+                    "👨‍💻 <b>Creator / Owner</b>\n\n"
+                    f"Name: <b>{CREATOR_NAME}</b>\n"
+                    f"Username: <code>{CONTACT_USERNAME}</code>\n"
+                    f"Link: {CONTACT_URL}"
+                )
+            )
+
+    except Exception as e:
+        print("Callback error:", e)
+
+
+# ============================================================
+# TEXT MESSAGE HANDLER
+# ============================================================
+
+@bot.message_handler(
+    content_types=["text"]
+)
+def text_handler(message):
+
+    try:
+
+        save_user(message)
+
+        user_id = message.from_user.id
+        user_text = clean_text(message.text)
+
+        # ----------------------------------------------------
+        # Save user message
+        # ----------------------------------------------------
+
+        save_all_memory(
+            user_id,
+            "user",
+            user_text
+        )
+
+        # ----------------------------------------------------
+        # Direct request check
+        # ----------------------------------------------------
+
+        if is_direct_request(user_text):
+
+            answer = smart_response(message)
+
+            save_all_memory(
+                user_id,
+                "assistant",
+                answer
+            )
+
+            # Direct request-এ কোনো Button দেওয়া হবে না
+            bot.send_message(
+                message.chat.id,
+                answer
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Normal response
+        # ----------------------------------------------------
+
+        answer = smart_response(message)
+
+        save_all_memory(
+            user_id,
+            "assistant",
+            answer
+        )
+
+        # Contact request-এ button
+        t = normalize(user_text)
+
+        if contains_any(t, [
+            "যোগাযোগ",
+            "contact",
+            "contact owner",
+            "contact creator"
+        ]):
+
+            bot.send_message(
+                message.chat.id,
+                answer,
+                reply_markup=contact_menu()
+            )
+
+        elif contains_any(t, [
+            "menu",
+            "মেনু"
+        ]):
+
+            bot.send_message(
+                message.chat.id,
+                answer,
+                reply_markup=main_menu()
+            )
+
+        else:
+
+            bot.send_message(
+                message.chat.id,
+                answer
+            )
+
+    except Exception as e:
+
+        print("Message handler error:", e)
+
+        try:
+            bot.send_message(
+                message.chat.id,
+                (
+                    "দুঃখিত, এই মুহূর্তে একটি ছোট সমস্যা হয়েছে। "
+                    "কিছুক্ষণ পর আবার চেষ্টা করুন।"
+                )
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# UNKNOWN COMMAND
+# ============================================================
+
+@bot.message_handler(
+    func=lambda message: message.text
+    and message.text.startswith("/")
+)
+def unknown_command(message):
+
+    bot.send_message(
+        message.chat.id,
+        (
+            "আমি এই Command-টি চিনতে পারিনি।\n\n"
+            "ব্যবহার করুন:\n"
+            "/start\n"
+            "/help\n"
+            "/menu"
+        )
+    )
+
+
+# ============================================================
+# ERROR-SAFE POLLING
+# ============================================================
+
+def run_bot():
+
+    print("=" * 55)
+    print(BOT_NAME)
+    print("=" * 55)
+    print("Creator:", CREATOR_NAME)
+    print("Website:", OFFICIAL_WEBSITE)
+    print("Channel:", CHANNEL_USERNAME)
+    print("Contact:", CONTACT_USERNAME)
+    print("=" * 55)
+
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print()
+        print("ERROR:")
+        print("Telegram Bot Token সেট করা হয়নি.")
+        print()
+        return
+
+    while True:
+
+        try:
+
+            print("Bot is starting...")
+
+            bot.remove_webhook()
+
+            time.sleep(1)
+
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=30,
+                skip_pending=True
+            )
+
+        except KeyboardInterrupt:
+
+            print("Bot stopped by user.")
+            break
+
+        except Exception as e:
+
+            print("Polling error:", e)
+            print("Restarting in 5 seconds...")
+
+            time.sleep(5)
+
+
+# ============================================================
+# PROGRAM START
+# ============================================================
+
+if __name__ == "__main__":
+    run_bot()
